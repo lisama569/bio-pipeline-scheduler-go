@@ -1,0 +1,10 @@
+# 本地运行产物
+/state/
+/examples/demo-workspace/state/
+/examples/demo-workspace/*.fq
+/examples/demo-workspace/*.bam
+/examples/demo-workspace/*.report
+/examples/demo-workspace/*.txt
+# 编译产物
+/scheduler
+*.tmp
