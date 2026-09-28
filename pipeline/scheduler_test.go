@@ -189,3 +189,138 @@ func contains(xs []string, v string) bool {
 	}
 	return false
 }
+
+// liveCounter 在步骤真正执行期间被增减，用来验证“整个执行过程中”的并发数。
+type liveCounter struct {
+	mu      sync.Mutex
+	current int
+	peak    int
+}
+
+func (c *liveCounter) inc() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.current++
+	if c.current > c.peak {
+		c.peak = c.current
+	}
+	return c.current
+}
+func (c *liveCounter) dec() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.current--
+}
+
+func TestGlobalConcurrencyLimitNeverExceeded(t *testing.T) {
+	const limit = 2
+	// 8 个互不依赖的步骤，全部慢执行，必然有排队时刻。
+	var steps []StepDef
+	funcs := map[string]func(ctx context.Context, attempt int) StepResult{}
+	live := &liveCounter{}
+	for i := 0; i < 8; i++ {
+		name := "s" + itoa(i)
+		steps = append(steps, StepDef{Name: name})
+		funcs[name] = func(ctx context.Context, attempt int) StepResult {
+			n := live.inc()
+			if n > limit {
+				t.Errorf("实时并发数 %d 超过全局上限 %d", n, limit)
+			}
+			time.Sleep(20 * time.Millisecond)
+			live.dec()
+			return StepResult{}
+		}
+	}
+	def := &PipelineDef{Name: "p", MaxRunning: limit, Steps: steps}
+	sch, _ := newTestScheduler(t, def, NewFuncExecutor(funcs))
+	rep, err := sch.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Status != RunComplete || len(rep.Succeeded) != 8 {
+		t.Fatalf("report: %+v", rep)
+	}
+	if sch.ConcurrencyViolations() != 0 {
+		t.Fatalf("调度器自观测到 %d 次超限", sch.ConcurrencyViolations())
+	}
+	if live.peak != limit {
+		t.Fatalf("期望峰值达到上限 %d，实际峰值 %d（测试未真正压到上限）", limit, live.peak)
+	}
+	t.Logf("全局上限=%d 执行过程峰值并发=%d 全程未超限", limit, live.peak)
+}
+
+func TestResourceQuotaNeverExceeded(t *testing.T) {
+	// 全局允许 6 个并行，但 cpu 标签配额只有 2、gpu 只有 1。
+	var steps []StepDef
+	funcs := map[string]func(ctx context.Context, attempt int) StepResult{}
+	cpuLive, gpuLive := &liveCounter{}, &liveCounter{}
+	mk := func(name, label string, live *liveCounter) {
+		steps = append(steps, StepDef{Name: name, Resources: map[string]string{label: "1"}})
+		funcs[name] = func(ctx context.Context, attempt int) StepResult {
+			n := live.inc()
+			limit := 2
+			if label == "gpu" {
+				limit = 1
+			}
+			if n > limit {
+				t.Errorf("资源 %s 实时占用 %d 超过配额 %d", label, n, limit)
+			}
+			time.Sleep(20 * time.Millisecond)
+			live.dec()
+			return StepResult{}
+		}
+	}
+	for i := 0; i < 5; i++ {
+		mk("cpu"+itoa(i), "cpu", cpuLive)
+	}
+	for i := 0; i < 3; i++ {
+		mk("gpu"+itoa(i), "gpu", gpuLive)
+	}
+	def := &PipelineDef{
+		Name: "p", MaxRunning: 6,
+		Quotas: map[string]int{"cpu": 2, "gpu": 1},
+		Steps:  steps,
+	}
+	sch, _ := newTestScheduler(t, def, NewFuncExecutor(funcs))
+	rep, err := sch.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Status != RunComplete {
+		t.Fatalf("report: %+v", rep)
+	}
+	if sch.ConcurrencyViolations() != 0 {
+		t.Fatalf("配额被突破: %d 次", sch.ConcurrencyViolations())
+	}
+	if cpuLive.peak != 2 || gpuLive.peak != 1 {
+		t.Fatalf("资源峰值异常 cpu=%d gpu=%d", cpuLive.peak, gpuLive.peak)
+	}
+	t.Logf("配额 cpu=2 gpu=1；执行过程峰值 cpu=%d gpu=%d，全程未突破", cpuLive.peak, gpuLive.peak)
+}
+
+func TestQueueingActuallyHappens(t *testing.T) {
+	// 上限 1 + 慢步骤：若排队失效，单测会在实时计数处失败；这里再断言耗时形态。
+	var steps []StepDef
+	funcs := map[string]func(ctx context.Context, attempt int) StepResult{}
+	live := &liveCounter{}
+	for i := 0; i < 4; i++ {
+		name := "s" + itoa(i)
+		steps = append(steps, StepDef{Name: name})
+		funcs[name] = func(ctx context.Context, attempt int) StepResult {
+			if live.inc() > 1 {
+				t.Errorf("并发超过 1")
+			}
+			time.Sleep(15 * time.Millisecond)
+			live.dec()
+			return StepResult{}
+		}
+	}
+	def := &PipelineDef{Name: "p", MaxRunning: 1, Steps: steps}
+	sch, _ := newTestScheduler(t, def, NewFuncExecutor(funcs))
+	if rep, err := sch.Run(context.Background()); err != nil || rep.Status != RunComplete {
+		t.Fatalf("run: %v %+v", err, rep)
+	}
+	if live.peak != 1 {
+		t.Fatalf("峰值应为 1，得到 %d", live.peak)
+	}
+}

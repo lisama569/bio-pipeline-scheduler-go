@@ -130,14 +130,21 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 
 	// queued 记录已经塞进 ready 通道但尚未被取走的步骤，避免重复入队。
 	queued := map[string]bool{}
+	// enqueue 只负责“若不在队列则入队”，非阻塞（通道容量 == 步骤数，必能放下）。
+	enqueue := func(name string) {
+		if queued[name] {
+			return
+		}
+		queued[name] = true
+		ready <- name
+	}
 	enqueueReady := func() {
 		for _, d := range sch.def.Steps {
 			if queued[d.Name] {
 				continue
 			}
 			if sch.isReady(d.Name) {
-				queued[d.Name] = true
-				ready <- d.Name
+				enqueue(d.Name)
 			}
 		}
 	}
@@ -191,8 +198,8 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 
 				// 获取全部资源：全局信号量 + 该步骤声明的每个标签 1 个配额。
 				if !tryAcquire(globalSem) {
-					// 全局容量满：等待至少一个 worker 释放后再重新排队。
-					queued[name] = true
+					// 全局容量满：把名字放回 ready 通道，等 worker 释放后再试。
+					enqueue(name)
 					select {
 					case <-ctx.Done():
 						loopErr <- ctx.Err()
@@ -222,7 +229,7 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 					for _, sem := range acquired {
 						<-sem
 					}
-					queued[name] = true
+					enqueue(name)
 					sch.log.Logf("[排队] 步骤=%s 等待资源标签=%s 释放配额", name, blockedLabel)
 					select {
 					case <-ctx.Done():
@@ -287,9 +294,10 @@ func (sch *Scheduler) reconcile(ctx context.Context, snap *Snapshot) *Snapshot {
 		if st.Status == StatusRunning {
 			sch.log.Logf("[恢复] 步骤 %s 上次运行中断在 running（已用尝试 %d 次），回到待执行重新执行",
 				st.Name, st.Attempts)
-			ev := sch.store.NewEvent(snap, st.Name,
+			nextSeq := snap.LastSeq + 1
+			ev, err := sch.store.AppendTransition(ctx, nextSeq, st.Name,
 				Transition{StatusRunning, StatusPending}, st.Attempts, "进程中断，恢复为待执行")
-			if err := sch.store.AppendEvent(ctx, ev); err != nil {
+			if err != nil {
 				sch.log.Logf("[恢复] 记录 stale running 事件失败: %v", err)
 				continue
 			}
@@ -438,7 +446,7 @@ func (sch *Scheduler) isReady(name string) bool {
 	return true
 }
 
-// transition 是所有状态变更的唯一入口：先写事件日志（fsync），再改内存并刷快照。
+// transition 是普通状态变更的唯一入口：原子追加事件日志（fsync），再改内存并刷快照。
 func (sch *Scheduler) transition(ctx context.Context, name string, from, to StepStatus, attempt int, detail string) error {
 	sch.mu.Lock()
 	st := sch.snap.Steps[name]
@@ -446,16 +454,20 @@ func (sch *Scheduler) transition(ctx context.Context, name string, from, to Step
 		sch.mu.Unlock()
 		return &RollbackError{Step: name, Expect: from, Found: st.Status}
 	}
-	ev := sch.store.NewEvent(sch.snap, name, Transition{from, to}, attempt, detail)
+	nextSeq := sch.snap.LastSeq + 1
 	sch.mu.Unlock()
 
-	if err := sch.store.AppendEvent(ctx, ev); err != nil {
+	ev, err := sch.store.AppendTransition(ctx, nextSeq, name, Transition{from, to}, attempt, detail)
+	if err != nil {
 		return err
 	}
 
 	sch.mu.Lock()
 	defer sch.mu.Unlock()
-	sch.snap.LastSeq = ev.Seq
+	// 序号可能与别的 goroutine 交错；以事件自身序号为准，只前进不倒退。
+	if ev.Seq > sch.snap.LastSeq {
+		sch.snap.LastSeq = ev.Seq
+	}
 	st.Status = to
 	if attempt > st.Attempts {
 		st.Attempts = attempt
@@ -467,13 +479,10 @@ func (sch *Scheduler) transition(ctx context.Context, name string, from, to Step
 	if to == StatusSucceeded {
 		st.LastError = ""
 	}
-	if err := sch.store.SaveSnapshot(sch.snap); err != nil {
-		return err
-	}
-	return nil
+	return sch.store.SaveSnapshot(sch.snap)
 }
 
-// succeed 在一次原子落盘中记录成功事件、状态与产出物。
+// succeed 在一次落盘流程中记录成功事件、状态与产出物（事件 fsync 后立即刷快照）。
 func (sch *Scheduler) succeed(ctx context.Context, name string, attempt int, outputs []string) error {
 	sch.mu.Lock()
 	st := sch.snap.Steps[name]
@@ -481,16 +490,20 @@ func (sch *Scheduler) succeed(ctx context.Context, name string, attempt int, out
 		sch.mu.Unlock()
 		return &RollbackError{Step: name, Expect: StatusRunning, Found: st.Status}
 	}
-	ev := sch.store.NewEvent(sch.snap, name, Transition{StatusRunning, StatusSucceeded}, attempt, "")
+	nextSeq := sch.snap.LastSeq + 1
 	sch.mu.Unlock()
 
-	if err := sch.store.AppendEvent(ctx, ev); err != nil {
+	ev, err := sch.store.AppendTransition(ctx, nextSeq, name,
+		Transition{StatusRunning, StatusSucceeded}, attempt, "")
+	if err != nil {
 		return err
 	}
 
 	sch.mu.Lock()
 	defer sch.mu.Unlock()
-	sch.snap.LastSeq = ev.Seq
+	if ev.Seq > sch.snap.LastSeq {
+		sch.snap.LastSeq = ev.Seq
+	}
 	st.Status = StatusSucceeded
 	if attempt > st.Attempts {
 		st.Attempts = attempt

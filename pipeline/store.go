@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -26,8 +27,9 @@ const (
 type Store struct {
 	dir       string
 	lock      *os.File
-	lastHashS string // 已落盘的最后一条事件哈希（内存缓存）
-	lastSeqN  int    // 已落盘的最后一条事件序号
+	writeMu   sync.Mutex // 串行化事件链追加与快照写入
+	lastHashS string     // 已落盘的最后一条事件哈希（内存缓存）
+	lastSeqN  int        // 已落盘的最后一条事件序号
 }
 
 // NewStore 打开（必要时创建）状态目录并取得排他文件锁。
@@ -147,10 +149,12 @@ func (s *Store) Recover(def *PipelineDef) (*Snapshot, error) {
 	authoritative.UpdatedAt = snap.UpdatedAt
 
 	// 预热哈希链缓存，使运行期追加事件不必每次重读日志。
+	s.writeMu.Lock()
 	if len(events) > 0 {
 		s.lastHashS = events[len(events)-1].Hash
 		s.lastSeqN = events[len(events)-1].Seq
 	}
+	s.writeMu.Unlock()
 	return authoritative, nil
 }
 
@@ -260,10 +264,18 @@ func legalTransition(from, to StepStatus) bool {
 	}
 }
 
-// NewEvent 基于当前事件链构造下一条事件并计算哈希。
-func (s *Store) NewEvent(snap *Snapshot, step string, tr Transition, attempt int, detail string) *Event {
+// AppendTransition 原子地完成「分配序号 -> 计算哈希链 -> 追加并 fsync」。
+// 多个 goroutine 并发调用时由 writeMu 串行化，保证事件序号与哈希链严格一致。
+// 返回已落盘的事件，调用方据此更新内存快照。
+func (s *Store) AppendTransition(ctx context.Context, seq int, step string, tr Transition, attempt int, detail string) (*Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	ev := &Event{
-		Seq:        snap.LastSeq + 1,
+		Seq:        seq,
 		Step:       step,
 		Transition: tr,
 		Attempt:    attempt,
@@ -272,38 +284,41 @@ func (s *Store) NewEvent(snap *Snapshot, step string, tr Transition, attempt int
 		PrevHash:   s.lastHashS,
 	}
 	ev.Hash = hashEvent(ev.PrevHash, eventPayload(ev))
-	return ev
-}
 
-// AppendEvent 持久化一条事件（先落盘并 fsync），并同步更新内存快照序号。
-// 事件日志只追加，从不修改历史记录。
-func (s *Store) AppendEvent(ctx context.Context, ev *Event) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	line, err := json.Marshal(ev)
 	if err != nil {
-		return fmt.Errorf("序列化事件失败: %w", err)
+		return nil, fmt.Errorf("序列化事件失败: %w", err)
 	}
 	f, err := os.OpenFile(filepath.Join(s.dir, eventsFile), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("打开事件日志失败: %w", err)
+		return nil, fmt.Errorf("打开事件日志失败: %w", err)
 	}
-	defer f.Close()
 	if _, err := f.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("追加事件失败: %w", err)
+		f.Close()
+		return nil, fmt.Errorf("追加事件失败: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		return fmt.Errorf("刷新事件日志失败: %w", err)
+		f.Close()
+		return nil, fmt.Errorf("刷新事件日志失败: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("关闭事件日志失败: %w", err)
 	}
 	// 仅在确保持久化成功后推进内存缓存。
 	s.lastHashS = ev.Hash
 	s.lastSeqN = ev.Seq
-	return nil
+	return ev, nil
 }
 
 // SaveSnapshot 原子写入快照（写临时文件 + fsync + rename）。
+// 与事件追加共用 writeMu，保证快照与事件链在磁盘上的先后顺序。
 func (s *Store) SaveSnapshot(snap *Snapshot) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.saveSnapshotLocked(snap)
+}
+
+func (s *Store) saveSnapshotLocked(snap *Snapshot) error {
 	snap.UpdatedAt = nowUTC()
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -319,10 +334,7 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 	if err := os.Rename(tmp, filepath.Join(s.dir, snapshotFile)); err != nil {
 		return fmt.Errorf("替换快照失败: %w", err)
 	}
-	if err := syncDir(s.dir); err != nil {
-		return err
-	}
-	return nil
+	return syncDir(s.dir)
 }
 
 func (s *Store) readSnapshot() (*Snapshot, error) {

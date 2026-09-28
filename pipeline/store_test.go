@@ -53,16 +53,18 @@ func TestRecoverAfterSucceededEvent(t *testing.T) {
 	s := newTestStore(t)
 	snap, _ := s.Bootstrap(def)
 
-	ev1 := s.NewEvent(snap, "a", Transition{StatusPending, StatusRunning}, 1, "")
-	if err := s.AppendEvent(context.Background(), ev1); err != nil {
+	ev1, err := s.AppendTransition(context.Background(), snap.LastSeq+1, "a",
+		Transition{StatusPending, StatusRunning}, 1, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	snap.LastSeq = 1
-	ev2 := s.NewEvent(snap, "a", Transition{StatusRunning, StatusSucceeded}, 1, "")
-	if err := s.AppendEvent(context.Background(), ev2); err != nil {
+	snap.LastSeq = ev1.Seq
+	ev2, err := s.AppendTransition(context.Background(), snap.LastSeq+1, "a",
+		Transition{StatusRunning, StatusSucceeded}, 1, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	snap.LastSeq = 2
+	snap.LastSeq = ev2.Seq
 	snap.Steps["a"].Status = StatusSucceeded
 	snap.Steps["a"].Attempts = 1
 	if err := s.SaveSnapshot(snap); err != nil {
@@ -83,12 +85,12 @@ func TestRecoverRejectsManualRollback(t *testing.T) {
 	s := newTestStore(t)
 	snap, _ := s.Bootstrap(def)
 
-	ev1 := s.NewEvent(snap, "a", Transition{StatusPending, StatusRunning}, 1, "")
-	s.AppendEvent(context.Background(), ev1)
-	snap.LastSeq = 1
-	ev2 := s.NewEvent(snap, "a", Transition{StatusRunning, StatusSucceeded}, 1, "")
-	s.AppendEvent(context.Background(), ev2)
-	snap.LastSeq = 2
+	ev1, _ := s.AppendTransition(context.Background(), snap.LastSeq+1, "a",
+		Transition{StatusPending, StatusRunning}, 1, "")
+	snap.LastSeq = ev1.Seq
+	ev2, _ := s.AppendTransition(context.Background(), snap.LastSeq+1, "a",
+		Transition{StatusRunning, StatusSucceeded}, 1, "")
+	snap.LastSeq = ev2.Seq
 	snap.Steps["a"].Status = StatusSucceeded
 	s.SaveSnapshot(snap)
 
@@ -115,8 +117,8 @@ func TestRecoverRejectsTamperedEvent(t *testing.T) {
 	def := testDef()
 	s := newTestStore(t)
 	snap, _ := s.Bootstrap(def)
-	ev := s.NewEvent(snap, "a", Transition{StatusPending, StatusRunning}, 1, "")
-	s.AppendEvent(context.Background(), ev)
+	s.AppendTransition(context.Background(), snap.LastSeq+1, "a",
+		Transition{StatusPending, StatusRunning}, 1, "")
 
 	// 篡改事件日志内容（detail），哈希链必须断裂。
 	p := filepath.Join(s.dir, eventsFile)
