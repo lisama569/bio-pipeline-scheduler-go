@@ -31,7 +31,9 @@ func (e *procExecutor) Execute(ctx context.Context, d StepDef, attempt int) Step
 	select {
 	case <-time.After(e.hold):
 	case <-ctx.Done():
-		// 进程被杀：这一步中断在 running，重启后应作为 stale running 重跑。
+		// 模拟步骤在执行中途因进程被杀死而中断：返回可重试的 ctx 错误。
+		// 进程随后结束（Run 在有界优雅期内收尾并释放文件锁），
+		// running 现场由下次启动按 stale running 恢复。
 		return StepResult{Err: &StepError{Kind: KindRetryable, Message: "interrupted by kill"}}
 	}
 	if v, ok := e.successCounts.Load(d.Name); ok {

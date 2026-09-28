@@ -29,6 +29,13 @@ type Store struct {
 	lock      *os.File
 	writeMu   sync.Mutex // 串行化事件链追加与快照写入
 	lastHashS string     // 已落盘的最后一条事件哈希（内存缓存）
+	lastSeqN  int        // 已落盘事件序号（仅在持 writeMu 时读写）
+}
+
+// nextSeqLocked 返回下一个事件序号；调用方必须持有 writeMu。
+func (s *Store) nextSeqLocked() int {
+	s.lastSeqN++
+	return s.lastSeqN
 }
 
 // NewStore 打开（必要时创建）状态目录并取得排他文件锁。
@@ -152,16 +159,12 @@ func (s *Store) Recover(def *PipelineDef) (*Snapshot, error) {
 				"步骤 %q 的 snapshot attempts=%d 领先于事件日志可证实的 %d",
 				name, st.Attempts, got.Attempts)}
 		}
-		// 日志已到终态（succeeded/failed/skipped），快照却是更早的非终态，
-		// 典型的“人为把已完成改回待执行”。崩溃窗口不会落在这种点上
-		//（成功/失败事件与其快照在同一 Commit 里，且终态不可能再被合法改写）。
-		if isTerminalStatus(got.Status) && st.Status != got.Status && statusRank(st.Status) < statusRank(got.Status) {
+		// 快照与日志“齐平”（last_seq 相等）时，每个步骤的状态理应就是日志终点。
+		// 此时若日志已到终态、快照却被改成更早的非终态，只能是人为回退 —— 拒绝。
+		// 而在“快照落后日志”的合法崩溃窗口里，快照保留的是较早一致点，
+		// 终态可能只存在于日志中，这种情况以日志为准，不算回退。
+		if !lagged && isTerminalStatus(got.Status) && st.Status != got.Status {
 			return nil, &RollbackError{Step: name, Expect: got.Status, Found: st.Status}
-		}
-		if lagged {
-			// 快照落后时，产出物等字段以日志回放为准；snapshot 中的 outputs 可信地
-			// 来自上一个已 Commit 的一致点，这里不额外比较，避免误报。
-			continue
 		}
 	}
 	if lagged {
@@ -184,6 +187,7 @@ func (s *Store) Recover(def *PipelineDef) (*Snapshot, error) {
 	s.writeMu.Lock()
 	if len(events) > 0 {
 		s.lastHashS = events[len(events)-1].Hash
+		s.lastSeqN = events[len(events)-1].Seq
 	}
 	s.writeMu.Unlock()
 	return authoritative, nil
@@ -323,15 +327,14 @@ func legalTransition(from, to StepStatus) bool {
 // AppendTransition 原子地完成「分配序号 -> 计算哈希链 -> 追加并 fsync」。
 // 多个 goroutine 并发调用时由 writeMu 串行化，保证事件序号与哈希链严格一致。
 // 返回已落盘的事件，调用方据此更新内存快照。
-func (s *Store) AppendTransition(ctx context.Context, seq int, step string, tr Transition, attempt int, detail string) (*Event, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+func (s *Store) AppendTransition(_ context.Context, _ int, step string, tr Transition, attempt int, detail string) (*Event, error) {
+	// 持久化不响应调用方 ctx 的取消：见 Commit 的说明。
+	// 序号在锁内统一分配（忽略调用方传入的期望值），保证多入口写日志也不跳号。
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	ev := &Event{
-		Seq:        seq,
+		Seq:        s.nextSeqLocked(),
 		Step:       step,
 		Transition: tr,
 		Attempt:    attempt,
@@ -373,15 +376,18 @@ func (s *Store) AppendTransition(ctx context.Context, seq int, step string, tr T
 // 这保证崩溃后快照绝不会领先于事件日志：能在快照里看到 seq=N，
 // 事件 1..N 就一定已 durable。mut 用来在落盘前/后就地更新快照字段，
 // 返回已落盘事件。调用方不应在 Commit 外另行保存快照。
-func (s *Store) Commit(ctx context.Context, snap *Snapshot, step string, tr Transition, attempt int, detail string, mut func(st *StepState, ev *Event)) (*Event, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+// Commit 持久化“一条事件 + 刷新后的快照”。它有意不响应调用方 ctx 的取消：
+// 调度器在步骤命令已经执行完之后才调用本方法，若此时因进程收到信号而取消 ctx
+// 就放弃落盘，会让已产出的步骤停在 running、重启后被重复执行。为保证
+// “不重复产出”，终态必须落盘；调用方应在这类路径传入独立 context。
+func (s *Store) Commit(_ context.Context, snap *Snapshot, step string, tr Transition, attempt int, detail string, mut func(st *StepState, ev *Event)) (*Event, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	ev := &Event{
-		Seq:        snap.LastSeq + 1,
+		// 序号必须在写锁内基于已落盘链长度分配：调用方在锁外读到的
+		// snap.LastSeq 可能已被其他并发提交超越，锁外 +1 会造成序号重复/跳号。
+		Seq:        s.nextSeqLocked(),
 		Step:       step,
 		Transition: tr,
 		Attempt:    attempt,
@@ -413,7 +419,9 @@ func (s *Store) Commit(ctx context.Context, snap *Snapshot, step string, tr Tran
 	s.lastHashS = ev.Hash
 
 	// 事件已 durable，再在同一临界区更新并落盘快照，杜绝两者交错。
-	snap.LastSeq = ev.Seq
+	if ev.Seq > snap.LastSeq {
+		snap.LastSeq = ev.Seq
+	}
 	if mut != nil {
 		if st := snap.Steps[step]; st != nil {
 			mut(st, ev)

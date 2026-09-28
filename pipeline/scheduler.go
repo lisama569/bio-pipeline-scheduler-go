@@ -2,7 +2,9 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,6 +38,9 @@ type Scheduler struct {
 	// 每个资源标签当前占用数与峰值。
 	resUsed map[string]int
 	resPeak map[string]int
+
+	// durable 用于“步骤已执行完后”的终态落盘，不随运行 ctx 取消。
+	durable context.Context
 }
 
 // NewScheduler 创建调度器。
@@ -57,8 +62,31 @@ func NewScheduler(def *PipelineDef, store *Store, exec Executor, log *Logger) *S
 	}
 }
 
+// gracefulShutdown 是取消后给在途步骤落盘终态的最长等待时间。
+var gracefulShutdown = 2 * time.Second
+
+// waitGroupTimeout 有界等待 WaitGroup；超时返回 false。
+func waitGroupTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
 // SetBackoff 覆盖重试退避时长（主要用于测试加速）。
 func (sch *Scheduler) SetBackoff(d time.Duration) { sch.backoff = d }
+
+// durableCtx 返回执行后落盘专用的 context，保证已执行步骤的终态不被取消。
+func (sch *Scheduler) durableCtx() context.Context {
+	if sch.durable != nil {
+		return sch.durable
+	}
+	return context.Background()
+}
 
 // PeakRunning 返回截至当前同时执行步骤数的历史峰值。
 func (sch *Scheduler) PeakRunning() int {
@@ -88,6 +116,14 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	// durable 独立于运行 ctx：步骤命令已经执行完时，其终态必须落盘，
+	// 不能因运行 ctx 被取消而丢成 stale running 导致重启重复执行。
+	// 它的生命周期严格短于 Run：Run 会等待所有 worker 收尾后才返回，
+	// 因此不会出现“Run 已返回、文件锁已释放，而旧 worker 仍在写”的跨进程竞争。
+	durableCtx, cancelDurable := context.WithCancel(context.Background())
+	defer cancelDurable()
+	sch.durable = durableCtx
+
 	sch.snap, err = sch.reconcile(ctx, snap)
 	if err != nil {
 		return nil, err
@@ -279,12 +315,21 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 	case <-finished:
 	case err := <-loopErr:
 		if err != nil {
-			// 等待已启动的 worker 退出，避免泄漏（worker 会响应 ctx 取消）。
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// 运行被取消：给在途 worker 一个有界优雅期，让已经执行完的步骤
+				// 用 durableCtx 落盘终态，然后才释放文件锁。超时仍未结束的 worker
+				// 随 cancelDurable 放弃（其状态停在 running，下次启动按 stale 恢复）。
+				waitGroupTimeout(&wg, gracefulShutdown)
+				cancelDurable()
+				return nil, err
+			}
 			wg.Wait()
+			cancelDurable()
 			return nil, err
 		}
 	}
 	wg.Wait()
+	cancelDurable()
 	close(results)
 
 	if err := sch.finishSnapshot(); err != nil {
@@ -370,8 +415,24 @@ func (sch *Scheduler) runStep(ctx context.Context, name string, attempt int) {
 	sch.log.Logf("[执行] 步骤=%s 尝试次数=%d 状态变化=pending -> running", name, attempt)
 
 	res := sch.exec.Execute(ctx, d, attempt)
+	// 命令已经真正执行：此后的终态落盘使用独立 context，
+	// 不被运行取消（SIGTERM/超时）打断，避免已产出的步骤被重复执行。
+	dctx := sch.durableCtx()
+
+	// 进程正在关闭（运行 ctx 被取消）且本步骤因此中断：不判失败、不额外消耗重试，
+	// 回到 pending 留作 stale，等下次启动重新执行（attempts 已记录本次尝试）。
+	if res.Err != nil && ctx.Err() != nil && isAbortError(res.Err) {
+		if err := sch.transition(dctx, name, StatusRunning, StatusPending, attempt,
+			"进程中断，步骤未完成"); err != nil {
+			sch.log.Logf("[中断] 步骤=%s 回到待执行时落盘失败: %v", name, err)
+		}
+		sch.log.Logf("[中断] 步骤=%s 尝试次数=%d 因进程关闭回到 pending", name, attempt)
+		sch.markFinished(name, d.Resources)
+		return
+	}
+
 	if res.Err == nil {
-		if err := sch.succeed(ctx, name, attempt, res.Outputs); err != nil {
+		if err := sch.succeed(dctx, name, attempt, res.Outputs); err != nil {
 			sch.log.Logf("[错误] 步骤 %s 落盘成功事件失败: %v", name, err)
 		}
 		sch.log.Logf("[完成] 步骤=%s 尝试次数=%d 状态变化=running -> succeeded 产出=%v",
@@ -389,7 +450,7 @@ func (sch *Scheduler) runStep(ctx context.Context, name string, attempt int) {
 	}
 	if retryable && attempt <= d.MaxRetries {
 		// running -> pending，等待协调器重新派发，退避后生效。
-		if err := sch.transition(ctx, name, StatusRunning, StatusPending, attempt,
+		if err := sch.transition(dctx, name, StatusRunning, StatusPending, attempt,
 			"可重试失败: "+firstLine(res.Err.Message)); err != nil {
 			sch.log.Logf("[错误] 步骤 %s 落盘重试事件失败: %v", name, err)
 		}
@@ -408,7 +469,7 @@ func (sch *Scheduler) runStep(ctx context.Context, name string, attempt int) {
 	if res.Err.Retryable() && attempt > d.MaxRetries {
 		reason = "重试次数已耗尽（" + itoa(attempt-1) + " 次重试），最后错误: " + firstLine(res.Err.Message)
 	}
-	if err := sch.transition(ctx, name, StatusRunning, StatusFailed, attempt, reason); err != nil {
+	if err := sch.transition(dctx, name, StatusRunning, StatusFailed, attempt, reason); err != nil {
 		sch.log.Logf("[错误] 步骤 %s 落盘失败事件失败: %v", name, err)
 	}
 	sch.log.Logf("[终态] 步骤=%s 尝试次数=%d 状态变化=running -> failed 原因=%s",
@@ -588,4 +649,26 @@ func firstLine(s string) string {
 		}
 	}
 	return s
+}
+
+// isAbortError 判断一个步骤失败是否由进程关闭（ctx 取消）导致，
+// 而不是步骤自身的业务失败。前者应回 pending 留作 stale，后者按失败处理。
+func isAbortError(e *StepError) bool {
+	if e == nil {
+		return false
+	}
+	switch e.Message {
+	case context.Canceled.Error(), context.DeadlineExceeded.Error():
+		return true
+	}
+	// 执行器（含测试与 shell 包装）可能在 ctx 取消时带上这些字样。
+	for _, frag := range []string{
+		"interrupted", "context canceled", "deadline exceeded",
+		"signal: killed", "signal: terminated",
+	} {
+		if strings.Contains(e.Message, frag) {
+			return true
+		}
+	}
+	return false
 }
