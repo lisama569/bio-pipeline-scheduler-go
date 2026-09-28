@@ -125,25 +125,58 @@ func (s *Store) Recover(def *PipelineDef) (*Snapshot, error) {
 		return nil, err
 	}
 
-	// 第三步：快照必须与日志回放结果一致，任何往回走的改动都会在这里暴露。
-	if authoritative.LastSeq != snap.LastSeq {
+	// 第三步：把磁盘快照与事件日志回放结果比对。
+	// 由于事件先 fsync、快照后原子替换，崩溃后只可能出现两种局面：
+	//   a) 快照领先日志（snap.LastSeq > 日志末尾）—— 不可能由正常崩溃产生，
+	//      说明事件日志被截断/删除，判为损坏；
+	//   b) 快照落后日志 —— 合法的崩溃窗口，以事件日志回放结果为准续跑。
+	// 此外逐步骤比较“进度”：把已完成状态人为改回 pending 这类回退必须拒绝。
+	if snap.LastSeq > authoritative.LastSeq {
 		return nil, &StateCorruptionError{Reason: fmt.Sprintf(
-			"snapshot 的 last_seq=%d 与事件日志末尾 seq=%d 不一致（事件日志可能被截断）",
+			"snapshot 的 last_seq=%d 领先于事件日志末尾 seq=%d（事件日志可能被截断或删除）",
 			snap.LastSeq, authoritative.LastSeq)}
 	}
+	lagged := snap.LastSeq < authoritative.LastSeq
 	for name, st := range snap.Steps {
 		got := authoritative.Steps[name]
 		if got == nil {
 			return nil, &StateCorruptionError{Reason: "snapshot 含未知步骤 " + name}
 		}
-		if st.Status != got.Status {
-			// 日志里已经走得更远，快照却被改回到更早的状态 —— 明确拒绝。
+		if statusRank(st.Status) > statusRank(got.Status) {
+			// 快照声称比事件日志走得更远，但日志里没有对应事件 —— 快照被伪造。
+			return nil, &StateCorruptionError{Reason: fmt.Sprintf(
+				"步骤 %q 的 snapshot 状态 %s 领先于事件日志可证实的状态 %s",
+				name, st.Status, got.Status)}
+		}
+		if st.Attempts > got.Attempts {
+			return nil, &StateCorruptionError{Reason: fmt.Sprintf(
+				"步骤 %q 的 snapshot attempts=%d 领先于事件日志可证实的 %d",
+				name, st.Attempts, got.Attempts)}
+		}
+		// 日志已到终态（succeeded/failed/skipped），快照却是更早的非终态，
+		// 典型的“人为把已完成改回待执行”。崩溃窗口不会落在这种点上
+		//（成功/失败事件与其快照在同一 Commit 里，且终态不可能再被合法改写）。
+		if isTerminalStatus(got.Status) && st.Status != got.Status && statusRank(st.Status) < statusRank(got.Status) {
 			return nil, &RollbackError{Step: name, Expect: got.Status, Found: st.Status}
 		}
-		if st.Attempts != got.Attempts {
-			return nil, &StateCorruptionError{Reason: fmt.Sprintf(
-				"步骤 %q 的 attempts 在 snapshot 中为 %d，事件日志回放为 %d（不允许回退重试计数）",
-				name, st.Attempts, got.Attempts)}
+		if lagged {
+			// 快照落后时，产出物等字段以日志回放为准；snapshot 中的 outputs 可信地
+			// 来自上一个已 Commit 的一致点，这里不额外比较，避免误报。
+			continue
+		}
+	}
+	if lagged {
+		// 产出物只记录在快照里（事件不含 outputs）：对已在上一个一致快照中
+		// 成功的步骤，沿用其产出物，避免落后续跑时丢失产出登记。
+		for name, st := range snap.Steps {
+			if st.Status == StatusSucceeded && authoritative.Steps[name].Status == StatusSucceeded {
+				authoritative.Steps[name].Outputs = append([]string(nil), st.Outputs...)
+			}
+		}
+		// 以事件日志为准，把快照补到一致点（原子写回），完成恢复。
+		authoritative.Status = runStatusFromSteps(authoritative.Steps)
+		if err := s.SaveSnapshot(authoritative); err != nil {
+			return nil, err
 		}
 	}
 	authoritative.UpdatedAt = snap.UpdatedAt
@@ -156,6 +189,31 @@ func (s *Store) Recover(def *PipelineDef) (*Snapshot, error) {
 	}
 	s.writeMu.Unlock()
 	return authoritative, nil
+}
+
+// statusRank 给状态一个粗略“进度”序，用于识别回退/伪造。
+func statusRank(x StepStatus) int {
+	switch x {
+	case StatusPending:
+		return 1
+	case StatusRunning:
+		return 2
+	case StatusSucceeded, StatusFailed, StatusSkipped:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func isTerminalStatus(x StepStatus) bool {
+	return x == StatusSucceeded || x == StatusFailed || x == StatusSkipped
+}
+
+func runStatusFromSteps(steps map[string]*StepState) RunStatus {
+	if !isTerminal(steps) {
+		return RunRunning
+	}
+	return terminalStatus(steps)
 }
 
 // validateSnapshotShape 检查快照覆盖且仅覆盖定义中的步骤，状态值合法。
@@ -307,6 +365,67 @@ func (s *Store) AppendTransition(ctx context.Context, seq int, step string, tr T
 	// 仅在确保持久化成功后推进内存缓存。
 	s.lastHashS = ev.Hash
 	s.lastSeqN = ev.Seq
+	return ev, nil
+}
+
+// Commit 原子地完成一次状态迁移的全部持久化：
+//
+//	在同一把写锁、同一个持久化顺序里
+//	「追加事件并 fsync」->「更新快照字段」->「原子替换快照并 fsync 目录」。
+//
+// 这保证崩溃后快照绝不会领先于事件日志：能在快照里看到 seq=N，
+// 事件 1..N 就一定已 durable。mut 用来在落盘前/后就地更新快照字段，
+// 返回已落盘事件。调用方不应在 Commit 外另行保存快照。
+func (s *Store) Commit(ctx context.Context, snap *Snapshot, step string, tr Transition, attempt int, detail string, mut func(st *StepState, ev *Event)) (*Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	ev := &Event{
+		Seq:        snap.LastSeq + 1,
+		Step:       step,
+		Transition: tr,
+		Attempt:    attempt,
+		Detail:     detail,
+		At:         nowUTC(),
+		PrevHash:   s.lastHashS,
+	}
+	ev.Hash = hashEvent(ev.PrevHash, eventPayload(ev))
+
+	line, err := json.Marshal(ev)
+	if err != nil {
+		return nil, fmt.Errorf("序列化事件失败: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(s.dir, eventsFile), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("打开事件日志失败: %w", err)
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("追加事件失败: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("刷新事件日志失败: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("关闭事件日志失败: %w", err)
+	}
+	s.lastHashS = ev.Hash
+	s.lastSeqN = ev.Seq
+
+	// 事件已 durable，再在同一临界区更新并落盘快照，杜绝两者交错。
+	snap.LastSeq = ev.Seq
+	if mut != nil {
+		if st := snap.Steps[step]; st != nil {
+			mut(st, ev)
+		}
+	}
+	if err := s.saveSnapshotLocked(snap); err != nil {
+		return nil, err
+	}
 	return ev, nil
 }
 

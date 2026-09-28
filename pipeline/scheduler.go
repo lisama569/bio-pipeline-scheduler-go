@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -87,7 +88,10 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 	if err != nil {
 		return nil, err
 	}
-	sch.snap = sch.reconcile(ctx, snap)
+	sch.snap, err = sch.reconcile(ctx, snap)
+	if err != nil {
+		return nil, err
+	}
 
 	// 2. 如果恢复出来已经全部终态，直接出报告（幂等重跑，不会重复产出）。
 	if isTerminal(sch.snap.Steps) {
@@ -242,9 +246,12 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 					continue
 				}
 
-				// 转 running 并落盘。
+				// 同步落盘 running；若失败则释放已获取的信号量后中止。
 				attempt := sch.nextAttempt(name)
 				if err := sch.transition(ctx, name, StatusPending, StatusRunning, attempt, ""); err != nil {
+					for _, sem := range acquired {
+						<-sem
+					}
 					loopErr <- err
 					return
 				}
@@ -288,31 +295,24 @@ func (sch *Scheduler) Run(ctx context.Context) (*RunReport, error) {
 
 // reconcile 处理恢复出来的状态：running 是上次进程被杀留下的 stale 状态，
 // 转回 pending 重跑（attempts 保留，不重复获得重试预算）。
-func (sch *Scheduler) reconcile(ctx context.Context, snap *Snapshot) *Snapshot {
-	changed := false
+func (sch *Scheduler) reconcile(ctx context.Context, snap *Snapshot) (*Snapshot, error) {
 	for _, st := range snap.Steps {
-		if st.Status == StatusRunning {
-			sch.log.Logf("[恢复] 步骤 %s 上次运行中断在 running（已用尝试 %d 次），回到待执行重新执行",
-				st.Name, st.Attempts)
-			nextSeq := snap.LastSeq + 1
-			ev, err := sch.store.AppendTransition(ctx, nextSeq, st.Name,
-				Transition{StatusRunning, StatusPending}, st.Attempts, "进程中断，恢复为待执行")
-			if err != nil {
-				sch.log.Logf("[恢复] 记录 stale running 事件失败: %v", err)
-				continue
-			}
-			snap.LastSeq = ev.Seq
-			st.Status = StatusPending
-			st.UpdatedAt = ev.At
-			changed = true
+		if st.Status != StatusRunning {
+			continue
+		}
+		sch.log.Logf("[恢复] 步骤 %s 上次运行中断在 running（已用尝试 %d 次），回到待执行重新执行",
+			st.Name, st.Attempts)
+		_, err := sch.store.Commit(ctx, snap, st.Name,
+			Transition{StatusRunning, StatusPending}, st.Attempts, "进程中断，恢复为待执行",
+			func(x *StepState, ev *Event) {
+				x.Status = StatusPending
+				x.UpdatedAt = ev.At
+			})
+		if err != nil {
+			return nil, fmt.Errorf("恢复 stale running 步骤 %s 失败: %w", st.Name, err)
 		}
 	}
-	if changed {
-		if err := sch.store.SaveSnapshot(snap); err != nil {
-			sch.log.Logf("[恢复] 保存快照失败: %v", err)
-		}
-	}
-	return snap
+	return snap, nil
 }
 
 // propagateFailures 把 failed 步骤尚未处理的全部下游（含传递依赖）标记为 skipped。
@@ -446,72 +446,52 @@ func (sch *Scheduler) isReady(name string) bool {
 	return true
 }
 
-// transition 是普通状态变更的唯一入口：原子追加事件日志（fsync），再改内存并刷快照。
+// transition 是普通状态变更的唯一入口：在调度器锁内调用 Store.Commit，
+// 事件追加与快照写入在同一持久化临界区完成，杜绝两者交错导致的状态损坏。
 func (sch *Scheduler) transition(ctx context.Context, name string, from, to StepStatus, attempt int, detail string) error {
 	sch.mu.Lock()
+	defer sch.mu.Unlock()
 	st := sch.snap.Steps[name]
 	if st.Status != from {
-		sch.mu.Unlock()
 		return &RollbackError{Step: name, Expect: from, Found: st.Status}
 	}
-	nextSeq := sch.snap.LastSeq + 1
-	sch.mu.Unlock()
-
-	ev, err := sch.store.AppendTransition(ctx, nextSeq, name, Transition{from, to}, attempt, detail)
-	if err != nil {
-		return err
-	}
-
-	sch.mu.Lock()
-	defer sch.mu.Unlock()
-	// 序号可能与别的 goroutine 交错；以事件自身序号为准，只前进不倒退。
-	if ev.Seq > sch.snap.LastSeq {
-		sch.snap.LastSeq = ev.Seq
-	}
-	st.Status = to
-	if attempt > st.Attempts {
-		st.Attempts = attempt
-	}
-	st.UpdatedAt = ev.At
-	if to == StatusFailed {
-		st.LastError = detail
-	}
-	if to == StatusSucceeded {
-		st.LastError = ""
-	}
-	return sch.store.SaveSnapshot(sch.snap)
+	_, err := sch.store.Commit(ctx, sch.snap, name, Transition{from, to}, attempt, detail,
+		func(x *StepState, ev *Event) {
+			x.Status = to
+			if attempt > x.Attempts {
+				x.Attempts = attempt
+			}
+			x.UpdatedAt = ev.At
+			switch to {
+			case StatusFailed:
+				x.LastError = detail
+			case StatusSucceeded:
+				x.LastError = ""
+			}
+		})
+	return err
 }
 
-// succeed 在一次落盘流程中记录成功事件、状态与产出物（事件 fsync 后立即刷快照）。
+// succeed 在一次原子落盘里记录成功事件、状态与产出物。
 func (sch *Scheduler) succeed(ctx context.Context, name string, attempt int, outputs []string) error {
 	sch.mu.Lock()
+	defer sch.mu.Unlock()
 	st := sch.snap.Steps[name]
 	if st.Status != StatusRunning {
-		sch.mu.Unlock()
 		return &RollbackError{Step: name, Expect: StatusRunning, Found: st.Status}
 	}
-	nextSeq := sch.snap.LastSeq + 1
-	sch.mu.Unlock()
-
-	ev, err := sch.store.AppendTransition(ctx, nextSeq, name,
-		Transition{StatusRunning, StatusSucceeded}, attempt, "")
-	if err != nil {
-		return err
-	}
-
-	sch.mu.Lock()
-	defer sch.mu.Unlock()
-	if ev.Seq > sch.snap.LastSeq {
-		sch.snap.LastSeq = ev.Seq
-	}
-	st.Status = StatusSucceeded
-	if attempt > st.Attempts {
-		st.Attempts = attempt
-	}
-	st.Outputs = append([]string(nil), outputs...)
-	st.LastError = ""
-	st.UpdatedAt = ev.At
-	return sch.store.SaveSnapshot(sch.snap)
+	_, err := sch.store.Commit(ctx, sch.snap, name,
+		Transition{StatusRunning, StatusSucceeded}, attempt, "",
+		func(x *StepState, ev *Event) {
+			x.Status = StatusSucceeded
+			if attempt > x.Attempts {
+				x.Attempts = attempt
+			}
+			x.Outputs = append([]string(nil), outputs...)
+			x.LastError = ""
+			x.UpdatedAt = ev.At
+		})
+	return err
 }
 
 func (sch *Scheduler) setLastError(name, msg string) {
