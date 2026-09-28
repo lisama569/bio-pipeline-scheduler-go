@@ -1,0 +1,40 @@
+{
+  "name": "exome-mini",
+  "steps": [
+    {
+      "name": "download_reads",
+      "command": "echo 'simulated reads' > reads.fq",
+      "outputs": ["reads.fq"],
+      "retries": 2,
+      "resources": {"tag": "network", "slots": 1}
+    },
+    {
+      "name": "align",
+      "command": "cat reads.fq > aligned.bam && echo aligned",
+      "depends_on": ["download_reads"],
+      "outputs": ["aligned.bam"],
+      "retries": 3,
+      "resources": {"tag": "cpu", "slots": 2}
+    },
+    {
+      "name": "mark_duplicates",
+      "command": "cp aligned.bam dedup.bam",
+      "depends_on": ["align"],
+      "outputs": ["dedup.bam"],
+      "resources": {"tag": "cpu", "slots": 1}
+    },
+    {
+      "name": "call_variants",
+      "command": "cp dedup.bam variants.vcf",
+      "depends_on": ["mark_duplicates"],
+      "outputs": ["variants.vcf"],
+      "resources": {"tag": "cpu", "slots": 2}
+    },
+    {
+      "name": "qc_report",
+      "command": "wc -c aligned.bam variants.vcf > qc.txt",
+      "depends_on": ["align", "call_variants"],
+      "outputs": ["qc.txt"]
+    }
+  ]
+}
