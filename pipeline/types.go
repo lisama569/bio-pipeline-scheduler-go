@@ -82,6 +82,7 @@ type Snapshot struct {
 // StepResult 是执行器返回的结果。
 type StepResult struct {
 	Outputs []string
+	LogPath string
 	Err     *StepError
 }
 
