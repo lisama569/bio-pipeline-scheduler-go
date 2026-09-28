@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -72,7 +71,7 @@ func TestRepeatedCrashThenConverge(t *testing.T) {
 			kill:          cancel,
 			successCounts: &successCounts,
 		}
-		sch := NewScheduler(def, s, exec, NewLogger(&strings.Builder{}))
+		sch := NewScheduler(def, s, exec, testLogger(t))
 		sch.SetBackoff(time.Millisecond)
 		return sch.Run(ctx)
 	}

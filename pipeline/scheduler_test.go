@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,8 +14,7 @@ func newTestScheduler(t *testing.T, def *PipelineDef, exec Executor) (*Scheduler
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	log := NewLogger(&strings.Builder{})
-	sch := NewScheduler(def, s, exec, log)
+	sch := NewScheduler(def, s, exec, testLogger(t))
 	sch.SetBackoff(time.Millisecond)
 	return sch, s
 }

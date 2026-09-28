@@ -56,7 +56,7 @@ func TestResumeDoesNotReexecuteCompleted(t *testing.T) {
 	// 先正常跑 a、b（c 永久失败会让 b->c 不被跳过地重跑，所以单独控制）。
 	{
 		s := openStore()
-		sch := NewScheduler(def, s, exec1, NewLogger(&strings.Builder{}))
+		sch := NewScheduler(def, s, exec1, testLogger(t))
 		sch.SetBackoff(time.Millisecond)
 		rep, err := sch.Run(context.Background())
 		if err != nil {
@@ -89,7 +89,7 @@ func TestResumeDoesNotReexecuteCompleted(t *testing.T) {
 	})
 	{
 		s := openStore()
-		sch := NewScheduler(def, s, exec2, NewLogger(&strings.Builder{}))
+		sch := NewScheduler(def, s, exec2, testLogger(t))
 		sch.SetBackoff(time.Millisecond)
 		rep, err := sch.Run(context.Background())
 		if err != nil {
@@ -249,7 +249,7 @@ func TestResumePreservesRetryBudget(t *testing.T) {
 		},
 	})
 	s, _ := NewStore(stateDir)
-	sch := NewScheduler(def, s, exec, NewLogger(&strings.Builder{}))
+	sch := NewScheduler(def, s, exec, testLogger(t))
 	sch.SetBackoff(time.Millisecond)
 	rep, err := sch.Run(context.Background())
 	if err != nil {
@@ -283,7 +283,7 @@ func TestSchedulerRejectsTamperedRollback(t *testing.T) {
 				"a": func(ctx context.Context, n int) StepResult {
 					return StepResult{Outputs: []string{"a.out"}}
 				},
-			}), NewLogger(&strings.Builder{}))
+			}), testLogger(t))
 		if rep, err := sch.Run(context.Background()); err != nil || rep.Status != RunComplete {
 			t.Fatalf("setup run: %v %+v", err, rep)
 		}
@@ -297,7 +297,7 @@ func TestSchedulerRejectsTamperedRollback(t *testing.T) {
 	writeFile(sp, data)
 
 	s, _ := NewStore(stateDir)
-	sch := NewScheduler(def, s, NewFuncExecutor(nil), NewLogger(&strings.Builder{}))
+	sch := NewScheduler(def, s, NewFuncExecutor(nil), testLogger(t))
 	_, err := sch.Run(context.Background())
 	s.Close()
 	var rb *RollbackError
