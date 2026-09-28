@@ -1,0 +1,42 @@
+{
+  "name": "demo-bio-pipeline",
+  "max_running": 3,
+  "quotas": {"cpu": 2},
+  "steps": [
+    {
+      "name": "download",
+      "command": "echo '模拟下载原始测序数据' && echo raw > raw.fq",
+      "outputs": ["raw.fq"],
+      "resources": {"cpu": "1"},
+      "description": "准备输入数据"
+    },
+    {
+      "name": "qc",
+      "command": "cp raw.fq clean.fq && echo '质控完成' > qc.report",
+      "depends_on": ["download"],
+      "outputs": ["clean.fq", "qc.report"],
+      "resources": {"cpu": "1"},
+      "max_retries": 2,
+      "description": "质量控制（前两次抖动、第三次成功，演示可重试）"
+    },
+    {
+      "name": "align",
+      "command": "cp clean.fq align.bam && echo aligned",
+      "depends_on": ["qc"],
+      "outputs": ["align.bam"],
+      "resources": {"cpu": "1"}
+    },
+    {
+      "name": "stats",
+      "command": "wc -c align.bam > stats.txt && echo done",
+      "depends_on": ["align"],
+      "outputs": ["stats.txt"]
+    },
+    {
+      "name": "report",
+      "command": "cat qc.report stats.txt > summary.txt",
+      "depends_on": ["stats"],
+      "outputs": ["summary.txt"]
+    }
+  ]
+}
