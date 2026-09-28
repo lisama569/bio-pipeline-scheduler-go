@@ -393,7 +393,6 @@ func (sch *Scheduler) runStep(ctx context.Context, name string, attempt int) {
 			"可重试失败: "+firstLine(res.Err.Message)); err != nil {
 			sch.log.Logf("[错误] 步骤 %s 落盘重试事件失败: %v", name, err)
 		}
-		sch.setLastError(name, res.Err.Message)
 		sch.log.Logf("[重试] 步骤=%s 状态变化=running -> pending，%s 后重试（还剩 %d 次）",
 			name, sch.backoff, d.MaxRetries-attempt+1)
 		sch.markFinished(name, d.Resources)
@@ -412,7 +411,6 @@ func (sch *Scheduler) runStep(ctx context.Context, name string, attempt int) {
 	if err := sch.transition(ctx, name, StatusRunning, StatusFailed, attempt, reason); err != nil {
 		sch.log.Logf("[错误] 步骤 %s 落盘失败事件失败: %v", name, err)
 	}
-	sch.setLastError(name, reason)
 	sch.log.Logf("[终态] 步骤=%s 尝试次数=%d 状态变化=running -> failed 原因=%s",
 		name, attempt, firstLine(reason))
 	sch.markFinished(name, d.Resources)
@@ -462,11 +460,10 @@ func (sch *Scheduler) transition(ctx context.Context, name string, from, to Step
 				x.Attempts = attempt
 			}
 			x.UpdatedAt = ev.At
-			switch to {
-			case StatusFailed:
-				x.LastError = detail
-			case StatusSucceeded:
+			if to == StatusSucceeded {
 				x.LastError = ""
+			} else if detail != "" {
+				x.LastError = detail
 			}
 		})
 	return err
@@ -492,12 +489,6 @@ func (sch *Scheduler) succeed(ctx context.Context, name string, attempt int, out
 			x.UpdatedAt = ev.At
 		})
 	return err
-}
-
-func (sch *Scheduler) setLastError(name, msg string) {
-	sch.mu.Lock()
-	defer sch.mu.Unlock()
-	sch.snap.Steps[name].LastError = msg
 }
 
 func (sch *Scheduler) markStarted(name string, res map[string]string) {

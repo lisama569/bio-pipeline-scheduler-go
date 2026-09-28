@@ -29,7 +29,6 @@ type Store struct {
 	lock      *os.File
 	writeMu   sync.Mutex // 串行化事件链追加与快照写入
 	lastHashS string     // 已落盘的最后一条事件哈希（内存缓存）
-	lastSeqN  int        // 已落盘的最后一条事件序号
 }
 
 // NewStore 打开（必要时创建）状态目录并取得排他文件锁。
@@ -185,7 +184,6 @@ func (s *Store) Recover(def *PipelineDef) (*Snapshot, error) {
 	s.writeMu.Lock()
 	if len(events) > 0 {
 		s.lastHashS = events[len(events)-1].Hash
-		s.lastSeqN = events[len(events)-1].Seq
 	}
 	s.writeMu.Unlock()
 	return authoritative, nil
@@ -364,7 +362,6 @@ func (s *Store) AppendTransition(ctx context.Context, seq int, step string, tr T
 	}
 	// 仅在确保持久化成功后推进内存缓存。
 	s.lastHashS = ev.Hash
-	s.lastSeqN = ev.Seq
 	return ev, nil
 }
 
@@ -414,7 +411,6 @@ func (s *Store) Commit(ctx context.Context, snap *Snapshot, step string, tr Tran
 		return nil, fmt.Errorf("关闭事件日志失败: %w", err)
 	}
 	s.lastHashS = ev.Hash
-	s.lastSeqN = ev.Seq
 
 	// 事件已 durable，再在同一临界区更新并落盘快照，杜绝两者交错。
 	snap.LastSeq = ev.Seq
