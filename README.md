@@ -135,12 +135,13 @@ logs/            每个步骤每次尝试的 stdout/stderr
 
 恢复语义：
 
-1. 读快照并**从头回放事件日志**，用哈希链校验日志未被截断或篡改，用事件重建权威状态；
-2. 快照与日志回放结果逐字段比对；
-3. 崩溃在 `running` 中途（只有进入事件、没有离开事件）的步骤回到 `pending` 重新执行，但**已用尝试次数保留**，不能靠重启获得额外重试预算；
+1. 读快照并**从头回放事件日志**，用哈希链校验日志未被截断或篡改，用事件重建权威状态；事件序号在存储写锁内分配，多个并发步骤提交也保证 1..N 连续无重复；
+2. 快照与事件日志对比：快照**领先**于日志（声称了日志无法证实的进度）判为损坏/截断；快照**落后**于日志是合法崩溃窗口（事件已 fsync、快照尚未替换），自动以日志为准补齐；只有在两者齐平时仍把终态改回早期状态，才算人为回退并拒绝；
+3. 崩溃在 `running` 中途（只有进入事件、没有离开事件）的步骤回到 `pending` 重新执行，但**已用尝试次数保留**，不能靠重启获得额外重试预算；若进程关闭导致正在执行的步骤被中断，它同样回到 pending，不会被误判为失败或消耗重试；
 4. `succeeded` / `failed` / `skipped` 终态步骤重启后不执行，因此不会重复产出；
-5. 如果把快照里的 `succeeded` 人为改回 `pending`，回放会发现日志里它已经走得更远，直接返回“状态回退”错误并指出步骤名，拒绝运行；
-6. 流程定义会计算指纹并与状态目录绑定，换了一份定义去复用同一状态目录会被拒绝（避免步骤对不上）。
+5. 步骤命令一旦真正执行完，其终态会在一个**有界优雅关闭期**内落盘且不被运行取消（SIGTERM）打断；`Run` 会等待全部在途步骤收尾后才返回并释放文件锁，因此不存在“旧进程还在后台写、新进程已开始”的跨进程竞争；
+6. 如果把快照里的 `succeeded` 人为改回 `pending`，回放会发现日志里它已经走得更远，直接返回“状态回退”错误并指出步骤名，拒绝运行；
+7. 流程定义会计算指纹并与状态目录绑定，换了一份定义去复用同一状态目录会被拒绝（避免步骤对不上）。
 
 ## 本地如何验证这些行为
 
@@ -158,7 +159,8 @@ go test ./... -race -v
 | 依赖缺失 | `TestValidateMissingDep` | 引用不存在步骤被拒绝 |
 | 并发上限 | `TestGlobalConcurrencyLimitNeverExceeded`、`TestResourceQuotaNeverExceeded`、`TestQueueingActuallyHappens` | 在步骤**执行期间**实时采样并发数，断言全程未超限，且峰值确实顶到上限（证明真的排队） |
 | 失败传播 | `TestFailurePropagation`、`TestPermanentFailureNotRetried`、`TestRetryBudgetExhausted` | 下游 skipped、独立步骤照常、不可重试不重试、预算耗尽才失败 |
-| 断点恢复 | `TestResumeFromStaleRunning`、`TestResumeDoesNotReexecuteCompleted`、`TestResumePreservesRetryBudget`、`TestSchedulerRejectsTamperedRollback` | stale running 重跑、已完成不重跑、尝试预算保留、人为回退被拒 |
+| 断点恢复 | `TestResumeFromStaleRunning`、`TestResumeDoesNotReexecuteCompleted`、`TestResumePreservesRetryBudget`、`TestSchedulerRejectsTamperedRollback`、`TestRepeatedCrashThenConverge` | stale running 重跑、已完成不重跑、尝试预算保留、人为回退被拒、连续多次“进程被杀”后重启仍收敛且每个步骤只成功提交一次 |
+| 持久化完整性 | `TestRecoverRejectsTamperedEvent`、`TestRecoverRejectsSnapshotAheadOfJournal`、`TestRecoverToleratesSnapshotLagging` | 事件篡改、快照领先（截断）被拒；快照合法落后可自动续上 |
 
 测试日志通过 `-v` 可见，运行期日志统一打印**步骤名、尝试次数、状态变化**，例如：
 
